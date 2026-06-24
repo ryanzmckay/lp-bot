@@ -22,7 +22,7 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TOKEN = os.environ.get("BOT_TOKEN", "8946359984:AAFRKAgqGY0NlQMjZorkRNFK7QQ37jXhEG4")
+TOKEN = os.environ["BOT_TOKEN"]
 EMAIL_FROM = os.environ.get("EMAIL_FROM")       # Gmail address to send FROM
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD") # Gmail app password
 EMAIL_TO = "ryanzmckay@gmail.com"
