@@ -1,5 +1,5 @@
 """
-LP Work Orders Telegram Bot
+LP Work Orders Telegram Bot - Clean version
 """
 import os, logging, smtplib, datetime
 from email.mime.multipart import MIMEMultipart
@@ -30,56 +30,80 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sessions[user_id] = {"photos": [], "texts": [], "caption": "", "state": "collecting"}
     await update.message.reply_text(
         "👋 *LP Work Orders Bot*\n\n"
-        "Forward me a message from your team (text + photos), then type *DONE* when finished.",
+        "Forward your team's message and photos here, then type *DONE* when finished.",
         parse_mode="Markdown"
     )
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     msg = update.message
+    if not msg:
+        return
 
+    # Auto-init session if user skipped /start
     if user_id not in sessions:
         sessions[user_id] = {"photos": [], "texts": [], "caption": "", "state": "collecting"}
 
     session = sessions[user_id]
+    state = session.get("state", "collecting")
+    text = (msg.text or "").strip() if msg.text else ""
 
-    # Only collect during collecting state
-    if session.get("state") != "collecting":
-        return
+    logger.info(f"User {user_id} | state={state} | text={repr(text)} | photo={bool(msg.photo)}")
 
-    if msg.photo:
-        session["photos"].append(msg.photo[-1].file_id)
-        if msg.caption:
-            session["caption"] = msg.caption
+    # --- COLLECTING STATE ---
+    if state == "collecting":
+        if msg.photo:
+            session["photos"].append(msg.photo[-1].file_id)
+            if msg.caption:
+                session["caption"] = msg.caption
+            n = len(session["photos"])
+            await msg.reply_text(f"📸 Photo {n} received. Type *DONE* when finished forwarding.", parse_mode="Markdown")
 
-    if msg.text and msg.text.upper() == "DONE":
-        # Move to location question
-        session["state"] = "location"
-        keyboard = [
-            [InlineKeyboardButton("🌿 Outdoor / Landscape", callback_data="loc_outdoor")],
-            [InlineKeyboardButton("🏠 Indoor / Room", callback_data="loc_indoor")],
-        ]
-        await update.message.reply_text(
-            "Got it! Is this *outdoor* or *indoor*?",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-    elif msg.text and not msg.text.startswith("/"):
-        session["texts"].append(msg.text)
-        # Acknowledge receipt
-        count = len(session["photos"])
-        await update.message.reply_text(
-            f"✅ Got it ({count} photo{'s' if count != 1 else ''} so far). Forward more or type *DONE* when ready.",
-            parse_mode="Markdown"
-        )
+        elif text.upper() == "DONE":
+            session["state"] = "location"
+            keyboard = [
+                [InlineKeyboardButton("🌿 Outdoor / Landscape", callback_data="loc_outdoor")],
+                [InlineKeyboardButton("🏠 Indoor / Room", callback_data="loc_indoor")],
+            ]
+            await msg.reply_text("Is this *outdoor* or *indoor*?", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-async def handle_location_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        elif text and not text.startswith("/"):
+            session["texts"].append(text)
+            await msg.reply_text(f"✅ Description noted. Forward photos or type *DONE* when ready.", parse_mode="Markdown")
+
+    # --- WAITING FOR ROOM NUMBER ---
+    elif state == "waiting_room":
+        session["location"] = f"Room {text}"
+        session["state"] = "dept"
+        await ask_dept(msg.reply_text)
+
+    # --- WAITING FOR CUSTOM LOCATION ---
+    elif state == "waiting_custom_loc":
+        session["location"] = text
+        session["state"] = "dept"
+        await ask_dept(msg.reply_text)
+
+    # --- WAITING FOR PRF NUMBER ---
+    elif state == "waiting_prf":
+        prf = text.upper()
+        if not prf.startswith("PRF-"):
+            prf = f"PRF-{prf.zfill(3)}"
+        session["prf_number"] = prf
+        session["state"] = "confirm"
+        await show_confirmation(msg.reply_text, session)
+
+async def ask_dept(reply_fn):
+    keyboard = [[InlineKeyboardButton(d, callback_data=f"dept_{d}") for d in row] for row in DEPT_OPTIONS]
+    await reply_fn("Which department?", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
     session = sessions.get(user_id, {})
+    data = query.data
 
-    if query.data == "loc_outdoor":
+    if data == "loc_outdoor":
         keyboard = [
             [InlineKeyboardButton("Back Lawn", callback_data="loc_Back Lawn"),
              InlineKeyboardButton("Front Lawn", callback_data="loc_Front Lawn")],
@@ -90,63 +114,44 @@ async def handle_location_type(update: Update, context: ContextTypes.DEFAULT_TYP
             [InlineKeyboardButton("✏️ Other", callback_data="loc_custom")],
         ]
         await query.edit_message_text("Which outdoor area?", reply_markup=InlineKeyboardMarkup(keyboard))
-    else:
+
+    elif data == "loc_indoor":
         session["state"] = "waiting_room"
-        await query.edit_message_text("Type the *room number*: (e.g. 35, 45)", parse_mode="Markdown")
+        await query.edit_message_text("Type the *room number:*", parse_mode="Markdown")
 
-async def handle_location_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    session = sessions.get(user_id, {})
-
-    if query.data == "loc_custom":
+    elif data == "loc_custom":
         session["state"] = "waiting_custom_loc"
         await query.edit_message_text("Type the outdoor area name:")
-    else:
-        session["location"] = query.data.replace("loc_", "")
+
+    elif data.startswith("loc_"):
+        session["location"] = data.replace("loc_", "")
         session["state"] = "dept"
-        await ask_dept(query.edit_message_text)
+        await query.edit_message_text("Which department?",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(d, callback_data=f"dept_{d}") for d in row] for row in DEPT_OPTIONS]))
 
-async def ask_dept(reply_fn):
-    keyboard = [[InlineKeyboardButton(d, callback_data=f"dept_{d}") for d in row] for row in DEPT_OPTIONS]
-    await reply_fn("Which department?", reply_markup=InlineKeyboardMarkup(keyboard))
+    elif data.startswith("dept_"):
+        session["dept"] = data.replace("dept_", "")
+        session["state"] = "waiting_prf"
+        await query.edit_message_text(
+            f"PRF number for *{session.get('location', '')}*?\n\nType it (e.g. `PRF-001`)",
+            parse_mode="Markdown")
 
-async def handle_dept(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    session = sessions.get(user_id, {})
-    session["dept"] = query.data.replace("dept_", "")
-    session["state"] = "waiting_prf"
-    await query.edit_message_text(
-        f"PRF number for *{session.get('location', '')}*?\n\nType it (e.g. `PRF-001`)",
-        parse_mode="Markdown"
-    )
+    elif data == "confirm_send":
+        pending = session.get("pending", {})
+        await query.edit_message_text("📤 Sending to Ryan...")
+        success = await send_email(context, pending)
+        if success:
+            await query.edit_message_text(
+                f"✅ *Sent!*\n📍 {pending['location']} · {pending['prf']}",
+                parse_mode="Markdown")
+        else:
+            await query.edit_message_text(
+                f"⚠️ Email failed. Tell Ryan:\n{pending['location']} | {pending['prf']}\n{pending['description']}")
+        sessions.pop(user_id, None)
 
-async def handle_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    session = sessions.get(user_id, {})
-    text = update.message.text.strip()
-    state = session.get("state")
-
-    if state == "waiting_room":
-        session["location"] = f"Room {text}"
-        session["state"] = "dept"
-        await ask_dept(update.message.reply_text)
-
-    elif state == "waiting_custom_loc":
-        session["location"] = text
-        session["state"] = "dept"
-        await ask_dept(update.message.reply_text)
-
-    elif state == "waiting_prf":
-        prf = text.upper()
-        if not prf.startswith("PRF-"):
-            prf = f"PRF-{prf.zfill(3)}"
-        session["prf_number"] = prf
-        session["state"] = "confirm"
-        await show_confirmation(update.message.reply_text, session)
+    elif data == "confirm_cancel":
+        sessions.pop(user_id, None)
+        await query.edit_message_text("Cancelled. Send /start to begin again.")
 
 async def show_confirmation(reply_fn, session):
     description = " ".join(session.get("texts", [])) + " " + session.get("caption", "")
@@ -155,52 +160,19 @@ async def show_confirmation(reply_fn, session):
     prf = session.get("prf_number", "PRF-001")
     dept = session.get("dept", "Maintenance")
     photos = session.get("photos", [])
-
     session["pending"] = {"location": location, "prf": prf, "dept": dept,
                           "description": description, "photo_ids": photos}
-
     keyboard = [[InlineKeyboardButton("✅ Send to Ryan", callback_data="confirm_send"),
                  InlineKeyboardButton("🗑 Cancel", callback_data="confirm_cancel")]]
     await reply_fn(
         f"📋 *Work Order Summary*\n\n"
-        f"📍 *Location:* {location}\n"
-        f"🔖 *PRF:* {prf}\n"
-        f"🏢 *Dept:* {dept}\n"
-        f"📸 *Photos:* {len(photos)}\n\n"
+        f"📍 *Location:* {location}\n🔖 *PRF:* {prf}\n🏢 *Dept:* {dept}\n📸 *Photos:* {len(photos)}\n\n"
         f"📝 _{description}_",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
-async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    session = sessions.get(user_id, {})
-
-    if query.data == "confirm_send":
-        pending = session.get("pending", {})
-        await query.edit_message_text("📤 Sending to Ryan...")
-        success = await send_email(context, pending)
-        if success:
-            await query.edit_message_text(
-                f"✅ *Sent to ryanzmckay@gmail.com*\n\n"
-                f"📍 {pending['location']} · {pending['prf']}",
-                parse_mode="Markdown"
-            )
-        else:
-            await query.edit_message_text(
-                f"⚠️ Email failed. Tell Ryan manually:\n"
-                f"Location: {pending['location']} | PRF: {pending['prf']}\n"
-                f"Desc: {pending['description']}"
-            )
-        sessions.pop(user_id, None)
-    else:
-        sessions.pop(user_id, None)
-        await query.edit_message_text("Cancelled. Send /start to begin a new work order.")
+        reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def send_email(context, pending):
     if not EMAIL_FROM or not EMAIL_PASSWORD:
+        logger.warning("No email credentials")
         return False
     try:
         msg = MIMEMultipart()
@@ -234,7 +206,7 @@ Paste into Claude PRF Workflow to generate PDF and vendor emails.
                 part.add_header("Content-Disposition", "attachment", filename=f"site_photo_{i+1}.jpg")
                 msg.attach(part)
             except Exception as e:
-                logger.error(f"Photo {i+1} error: {e}")
+                logger.error(f"Photo error: {e}")
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(EMAIL_FROM, EMAIL_PASSWORD)
             server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
@@ -246,13 +218,8 @@ Paste into Claude PRF Workflow to generate PDF and vendor emails.
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(handle_location_type, pattern="^loc_(outdoor|indoor)$"))
-    app.add_handler(CallbackQueryHandler(handle_location_selection, pattern="^loc_"))
-    app.add_handler(CallbackQueryHandler(handle_dept, pattern="^dept_"))
-    app.add_handler(CallbackQueryHandler(handle_confirm, pattern="^confirm_"))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_message))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_reply))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(handle_callbacks))
+    app.add_handler(MessageHandler(filters.ALL, handle_all))
     logger.info("Bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
